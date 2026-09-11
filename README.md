@@ -14,7 +14,8 @@ added the day it is reachable, no code change.
 | --- | --- |
 | Discovery | `eth_getBlockByNumber(latest, true)` — full transactions in one round trip, so a target's mint is visible without a second call for receipts or logs |
 | Sampling | Several polls stay in flight at once (`MAX_IN_FLIGHT_POLLS`), so the head is sampled every `POLL_INTERVAL_MS` even though a round trip takes ~90ms |
-| Gap recovery | Nitro produces blocks faster than any poll loop; skipped blocks are fetched in parallel and replayed through the same pipeline |
+| Gap recovery | Nitro produces blocks faster than any poll loop; skipped blocks are fetched in parallel (`BACKFILL_CONCURRENCY`), retried once, and replayed through the same pipeline |
+| Throttling | An endpoint that answers `429`/`503` is parked with an exponential cooldown and skipped while the rest of the pool serves; the poll cadence stretches to `MAX_POLL_INTERVAL_MS` and creeps back to `POLL_INTERVAL_MS` once it recovers |
 | Redundancy | Every RPC call is raced across all configured endpoints (`Promise.any`), transactions are broadcast to all of them at once |
 | Hot path | Nonce and gas prices are cached in the background; a detected mint goes straight to sign → broadcast with zero pre-flight RPC calls |
 | Transport | Persistent keep-alive sockets — no TLS handshake at the moment it matters |
