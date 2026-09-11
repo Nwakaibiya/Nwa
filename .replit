@@ -1,0 +1,17 @@
+entrypoint = "src/index.ts"
+modules = ["nodejs-20"]
+run = "npm install && npm start"
+
+[nix]
+channel = "stable-24_05"
+
+[env]
+NODE_ENV = "production"
+
+[deployment]
+run = ["sh", "-c", "npm install && npm start"]
+deploymentTarget = "vm"
+
+[[ports]]
+localPort = 3000
+externalPort = 80
