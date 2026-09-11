@@ -9,7 +9,9 @@ export interface Config {
   rpcUrls: string[];
   privateKey: `0x${string}` | undefined;
   pollIntervalMs: number;
+  maxPollIntervalMs: number;
   maxInFlight: number;
+  backfillConcurrency: number;
   rpcTimeoutMs: number;
   feeRefreshMs: number;
   dataFile: string;
@@ -75,8 +77,10 @@ export function loadConfig(options: LoadOptions = {}): Config {
     chain,
     rpcUrls,
     privateKey: privateKey as `0x${string}` | undefined,
-    pollIntervalMs: numberEnv('POLL_INTERVAL_MS', 60),
-    maxInFlight: numberEnv('MAX_IN_FLIGHT_POLLS', 4),
+    pollIntervalMs: numberEnv('POLL_INTERVAL_MS', 250),
+    maxPollIntervalMs: numberEnv('MAX_POLL_INTERVAL_MS', 2000),
+    maxInFlight: numberEnv('MAX_IN_FLIGHT_POLLS', 3),
+    backfillConcurrency: numberEnv('BACKFILL_CONCURRENCY', 4),
     rpcTimeoutMs: numberEnv('RPC_TIMEOUT_MS', 4000),
     feeRefreshMs: numberEnv('FEE_REFRESH_MS', 2500),
     dataFile: process.env.DATA_FILE?.trim() || 'data/state.json',

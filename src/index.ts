@@ -37,7 +37,9 @@ async function main(): Promise<void> {
 
   const watcher = new Watcher(rpc, {
     pollIntervalMs: config.pollIntervalMs,
+    maxPollIntervalMs: config.maxPollIntervalMs,
     maxInFlight: config.maxInFlight,
+    backfillConcurrency: config.backfillConcurrency,
     isTarget: (address: Address) => store.targets.some((target) => target.address === address),
     onDetection: (detection) => engine.handle(detection),
   });

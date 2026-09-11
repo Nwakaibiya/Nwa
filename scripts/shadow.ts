@@ -33,7 +33,9 @@ async function main(): Promise<void> {
   const engine = new Engine(store, rpc, config.chain, (message) => console.log(`\n${message}\n`), undefined);
   const watcher = new Watcher(rpc, {
     pollIntervalMs: config.pollIntervalMs,
+    maxPollIntervalMs: config.maxPollIntervalMs,
     maxInFlight: config.maxInFlight,
+    backfillConcurrency: config.backfillConcurrency,
     isTarget: (address) => store.targets.some((target) => target.address === address),
     onDetection: (detection) => engine.handle(detection),
   });
@@ -43,21 +45,30 @@ async function main(): Promise<void> {
   watcher.stop();
 
   console.log('\n--- shadow run summary ---');
-  console.log(`blocks seen live: ${watcher.blocksSeen} · backfilled: ${watcher.blocksBackfilled}`);
+  console.log(
+    `blocks seen live: ${watcher.blocksSeen} · backfilled: ${watcher.blocksBackfilled} · missed: ${watcher.blocksMissed}`,
+  );
   console.log(`last poll rtt: ${watcher.lastPollMs.toFixed(0)}ms`);
+  console.log(
+    `throttle backoffs: ${watcher.throttleEvents} · final poll interval: ${Math.round(watcher.pollIntervalMs)}ms`,
+  );
+  console.log(`rpc rate limit hits: ${rpc.stats.map((stat) => `${stat.url} ${stat.rateLimited}`).join(', ')}`);
   console.log('engine stats:', engine.stats);
   await store.flush();
   process.exit(0);
 }
 
 async function busiestSenders(rpc: RpcPool, count: number): Promise<Address[]> {
-  const head = await rpc.race<Hex>('eth_blockNumber');
+  const head = await withRetry(() => rpc.race<Hex>('eth_blockNumber'));
   const numbers = Array.from({ length: 5 }, (_, index) => BigInt(head) - BigInt(index));
-  const blocks = await Promise.all(
-    numbers.map((number) =>
-      rpc.call<{ transactions: RawTx[] } | null>('eth_getBlockByNumber', [`0x${number.toString(16)}`, true]),
-    ),
-  );
+  const blocks: ({ transactions: RawTx[] } | null)[] = [];
+  for (const number of numbers) {
+    blocks.push(
+      await withRetry(() =>
+        rpc.call<{ transactions: RawTx[] } | null>('eth_getBlockByNumber', [`0x${number.toString(16)}`, true]),
+      ),
+    );
+  }
   const counts = new Map<Address, number>();
   for (const block of blocks) {
     for (const tx of block?.transactions ?? []) {
@@ -70,6 +81,20 @@ async function busiestSenders(rpc: RpcPool, count: number): Promise<Address[]> {
     .sort((a, b) => b[1] - a[1])
     .slice(0, count)
     .map(([address]) => address);
+}
+
+/** Sampling the chain to pick wallets must survive a throttled public RPC. */
+async function withRetry<T>(fn: () => Promise<T>, attempts = 5): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+    }
+  }
+  throw lastError;
 }
 
 void main().catch((error: Error) => {

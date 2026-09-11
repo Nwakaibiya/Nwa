@@ -29,12 +29,36 @@ export class JsonRpcError extends Error {
   }
 }
 
+export class HttpError extends Error {
+  constructor(
+    readonly status: number,
+    url: string,
+  ) {
+    super(`HTTP ${status} from ${url}`);
+    this.name = 'HttpError';
+  }
+}
+
+export class RateLimitedError extends Error {
+  constructor(readonly retryInMs: number) {
+    super(`all RPC endpoints are rate limited, retry in ${Math.ceil(retryInMs)}ms`);
+    this.name = 'RateLimitedError';
+  }
+}
+
+const MIN_COOLDOWN_MS = 250;
+const MAX_COOLDOWN_MS = 8000;
+
 interface EndpointStats {
   url: string;
   wins: number;
   calls: number;
   errors: number;
   lastLatencyMs: number;
+  /** Wall clock after which the endpoint may be used again. */
+  cooldownUntil: number;
+  cooldownMs: number;
+  rateLimited: number;
 }
 
 export class RpcPool {
@@ -47,7 +71,48 @@ export class RpcPool {
     private readonly timeoutMs = 4000,
   ) {
     if (urls.length === 0) throw new Error('RpcPool requires at least one endpoint');
-    this.stats = urls.map((url) => ({ url, wins: 0, calls: 0, errors: 0, lastLatencyMs: 0 }));
+    this.stats = urls.map((url) => ({
+      url,
+      wins: 0,
+      calls: 0,
+      errors: 0,
+      lastLatencyMs: 0,
+      cooldownUntil: 0,
+      cooldownMs: 0,
+      rateLimited: 0,
+    }));
+  }
+
+  /**
+   * Public endpoints answer a burst of polls with 429 instead of data, and
+   * retrying immediately only deepens the ban, so a throttled endpoint is
+   * parked with an exponentially growing cooldown and healed on first success.
+   */
+  private throttle(index: number, retryAfter: string | null): void {
+    const stat = this.stats[index]!;
+    const header = Number(retryAfter);
+    const hinted = Number.isFinite(header) && header > 0 ? header * 1000 : 0;
+    stat.cooldownMs = Math.min(
+      MAX_COOLDOWN_MS,
+      Math.max(hinted, stat.cooldownMs ? stat.cooldownMs * 2 : MIN_COOLDOWN_MS),
+    );
+    stat.cooldownUntil = Date.now() + stat.cooldownMs;
+    stat.rateLimited += 1;
+  }
+
+  /** Endpoints that are not parked, or an empty list when everything is. */
+  private available(): number[] {
+    const now = Date.now();
+    return this.stats.flatMap((stat, index) => (stat.cooldownUntil <= now ? [index] : []));
+  }
+
+  private rateLimitedError(): RateLimitedError {
+    const soonest = Math.min(...this.stats.map((stat) => stat.cooldownUntil));
+    return new RateLimitedError(Math.max(0, soonest - Date.now()));
+  }
+
+  get throttled(): boolean {
+    return this.available().length === 0;
   }
 
   private async send<T>(index: number, method: string, params: unknown[]): Promise<T> {
@@ -61,10 +126,16 @@ export class RpcPool {
         body: JSON.stringify({ jsonrpc: '2.0', id: ++this.id, method, params }),
         signal: AbortSignal.timeout(this.timeoutMs),
       });
-      if (!response.ok) throw new Error(`HTTP ${response.status} from ${stat.url}`);
+      if (response.status === 429 || response.status === 503) {
+        this.throttle(index, response.headers.get('retry-after'));
+        throw new HttpError(response.status, stat.url);
+      }
+      if (!response.ok) throw new HttpError(response.status, stat.url);
       const payload = (await response.json()) as { result?: T; error?: RpcError };
       if (payload.error) throw new JsonRpcError(payload.error);
       stat.lastLatencyMs = performance.now() - started;
+      stat.cooldownMs = 0;
+      stat.cooldownUntil = 0;
       return payload.result as T;
     } catch (error) {
       stat.errors += 1;
@@ -74,8 +145,10 @@ export class RpcPool {
 
   /** Fan out to every endpoint and keep the first success — lowest achievable latency. */
   async race<T>(method: string, params: unknown[] = []): Promise<T> {
-    if (this.urls.length === 1) return this.send<T>(0, method, params);
-    const attempts = this.urls.map((_, index) =>
+    const usable = this.available();
+    if (usable.length === 0) throw this.rateLimitedError();
+    if (usable.length === 1) return this.send<T>(usable[0]!, method, params);
+    const attempts = usable.map((index) =>
       this.send<T>(index, method, params).then((result) => {
         this.stats[index]!.wins += 1;
         return result;
@@ -88,11 +161,13 @@ export class RpcPool {
 
   /** Round-robin for calls that are not on the hot path. */
   async call<T>(method: string, params: unknown[] = []): Promise<T> {
-    const start = this.cursor++ % this.urls.length;
+    const usable = this.available();
+    if (usable.length === 0) throw this.rateLimitedError();
+    const start = this.cursor++ % usable.length;
     let lastError: unknown;
-    for (let offset = 0; offset < this.urls.length; offset += 1) {
+    for (let offset = 0; offset < usable.length; offset += 1) {
       try {
-        return await this.send<T>((start + offset) % this.urls.length, method, params);
+        return await this.send<T>(usable[(start + offset) % usable.length]!, method, params);
       } catch (error) {
         lastError = error;
       }
